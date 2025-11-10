@@ -1,0 +1,16 @@
+{
+  "name": "latvian-voice-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "fastify": "^5.6.2",
+    "undici": "^7.16.0",
+    "ws": "^8.18.3"
+  }
+}
