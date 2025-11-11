@@ -1,6 +1,7 @@
 import http from "http";
 import dotenv from "dotenv";
 import { instructionsPaulaLV } from "./prompts/paula_lv.js";
+import WebSocket from "ws";
 
 dotenv.config();
 
@@ -31,24 +32,72 @@ async function acceptCall(callId, payload) {
 // small buffer after accept to avoid race conditions
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// --- keep this say(): single source of truth ---
-async function say(callId, text) {
-  const url = `https://api.openai.com/v1/realtime/calls/${callId}/responses`; // plural
-  const body = { instructions: text, modalities: ["audio"] };
-  const headers = {
-    "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-    "Content-Type": "application/json",
-    "OpenAI-Beta": "realtime=v1",
-    ...(process.env.OPENAI_PROJECT && { "OpenAI-Project": process.env.OPENAI_PROJECT }),
-  };
-  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
-  const t = await res.text();
-  log("say() →", res.status, t);
-  return { status: res.status, body: t };
+/**
+ * Open a short-lived Realtime WebSocket bound to this call
+ * and queue 3 responses: GDPR → intro → tiny comfort ping.
+ */
+async function speakFirst(callId, lines) {
+  return new Promise((resolve) => {
+    const params = new URLSearchParams({
+      model: process.env.MODEL || "gpt-4o-realtime-preview",
+      voice: process.env.VOICE || "marin",
+      input_audio_format: "g711_ulaw",
+      output_audio_format: "g711_ulaw",
+      call_id: callId,
+    });
+
+    const ws = new WebSocket(`wss://api.openai.com/v1/realtime?${params.toString()}`, {
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+        ...(process.env.OPENAI_PROJECT && { "OpenAI-Project": process.env.OPENAI_PROJECT }),
+      }
+    });
+
+    ws.on("open", () => {
+      // small delay so PSTN/SIP bridge is fully ready
+      setTimeout(() => {
+        // 1) GDPR line
+        ws.send(JSON.stringify({
+          type: "response.create",
+          response: { instructions: lines[0], modalities: ["audio"] }
+        }));
+
+        // 2) Intro after a short gap
+        setTimeout(() => {
+          ws.send(JSON.stringify({
+            type: "response.create",
+            response: { instructions: lines[1], modalities: ["audio"] }
+          }));
+
+          // 3) Comfort ping ~1s later (helps if the first packet gets swallowed)
+          setTimeout(() => {
+            ws.send(JSON.stringify({
+              type: "response.create",
+              response: { instructions: "Sveiki.", modalities: ["audio"] }
+            }));
+
+            // close shortly after queuing messages
+            setTimeout(() => { try { ws.close(); } catch {} resolve(); }, 400);
+          }, 1000);
+        }, 300);
+      }, 700);
+    });
+
+    ws.on("message", (buf) => {
+      try {
+        const evt = JSON.parse(buf.toString());
+        if (evt.type?.startsWith("response.") || evt.type === "error") {
+          log("WS evt:", evt.type);
+          if (evt.type === "error") log("WS error:", evt);
+        }
+      } catch {}
+    });
+
+    ws.on("error", (e) => { log("WS error:", e?.message || e); resolve(); });
+    ws.on("close", () => { log("WS closed"); resolve(); });
+  });
 }
-
-
-
 
 // ---------- mock calendar config ----------
 const TZ = process.env.TZ || "Europe/Riga";
@@ -133,28 +182,12 @@ const server = http.createServer(async (req, res) => {
 
         const accept = await acceptCall(callId, payload);
 
-        
         if (accept.ok) {
-        // give the realtime session a moment to fully open audio
-        await sleep(700); // 600–800ms is a good window
-
-        // GDPR line — retry once if non-200
-        let r1 = await say(callId, "Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.");
-        if (r1.status !== 200) {
-          await sleep(400);
-          r1 = await say(callId, "Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.");
+          await speakFirst(callId, [
+            "Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.",
+            "Labdien! Te Paula no Aivify. Ar ko man ir gods runāt?"
+          ]);
         }
-
-        // short gap, then intro
-           await sleep(250);
-           const r2 = await say(callId, "Labdien! Te Paula no Aivify. Ar ko man ir gods runāt?");
-
-        // PSTN comfort ping: if the bridge swallows the first line, this usually breaks silence
-           if (r2.status === 200) {
-            setTimeout(() => { say(callId, "Sveiki."); }, 1000); // tiny second utterance
-            }
-          }
-
 
         res.writeHead(200, { "Content-Type": "application/json" });
         return res.end(JSON.stringify({ received: true, accept_status: accept.status }));
