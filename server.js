@@ -78,7 +78,6 @@ const server = http.createServer(async (req, res) => {
         }
 
         const payload = {
-          type: "realtime",
           model: "gpt-4o-realtime-preview",
           // Optional configuration for later:
           // voice: "verse",
