@@ -31,21 +31,22 @@ async function acceptCall(callId, payload) {
 // small buffer after accept to avoid race conditions
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// --- keep this say(): single source of truth ---
 async function say(callId, text) {
-  const url = `https://api.openai.com/v1/realtime/calls/${callId}/responses`; // << plural
+  const url = `https://api.openai.com/v1/realtime/calls/${callId}/responses`; // plural
   const body = { instructions: text, modalities: ["audio"] };
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(body)
-  });
+  const headers = {
+    "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+    "Content-Type": "application/json",
+    "OpenAI-Beta": "realtime=v1",
+    ...(process.env.OPENAI_PROJECT && { "OpenAI-Project": process.env.OPENAI_PROJECT }),
+  };
+  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
   const t = await res.text();
   log("say() →", res.status, t);
   return { status: res.status, body: t };
 }
+
 
 
 
@@ -132,21 +133,28 @@ const server = http.createServer(async (req, res) => {
 
         const accept = await acceptCall(callId, payload);
 
+        
         if (accept.ok) {
-          // give the realtime session a moment to fully open audio
-          await sleep(600);
+        // give the realtime session a moment to fully open audio
+        await sleep(700); // 600–800ms is a good window
 
-          // GDPR line — retry once if first attempt fails
-          let ok1 = await say(callId, "Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.");
-          if (!ok1) {
-            await sleep(400);
-            ok1 = await say(callId, "Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.");
+        // GDPR line — retry once if non-200
+        let r1 = await say(callId, "Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.");
+        if (r1.status !== 200) {
+          await sleep(400);
+          r1 = await say(callId, "Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.");
+        }
+
+        // short gap, then intro
+           await sleep(250);
+           const r2 = await say(callId, "Labdien! Te Paula no Aivify. Ar ko man ir gods runāt?");
+
+        // PSTN comfort ping: if the bridge swallows the first line, this usually breaks silence
+           if (r2.status === 200) {
+            setTimeout(() => { say(callId, "Sveiki."); }, 1000); // tiny second utterance
+            }
           }
 
-          // short gap, then intro
-          await sleep(200);
-          await say(callId, "Labdien! Te Paula no Aivify. Ar ko man ir gods runāt?");
-        }
 
         res.writeHead(200, { "Content-Type": "application/json" });
         return res.end(JSON.stringify({ received: true, accept_status: accept.status }));
