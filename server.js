@@ -32,25 +32,21 @@ async function acceptCall(callId, payload) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function say(callId, text) {
-  const url = `https://api.openai.com/v1/realtime/calls/${callId}/response`; // ← singular!
-  const headers = {
-    "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-    "Content-Type": "application/json",
-    "OpenAI-Beta": "realtime=v1",
-    ...(process.env.OPENAI_PROJECT && { "OpenAI-Project": process.env.OPENAI_PROJECT }),
-  };
-  const resp = await fetch(url, {
+  const url = `https://api.openai.com/v1/realtime/calls/${callId}/responses`; // << plural
+  const body = { instructions: text, modalities: ["audio"] };
+  const res = await fetch(url, {
     method: "POST",
-    headers,
-    body: JSON.stringify({
-      instructions: text,
-      modalities: ["audio"],     // force TTS
-    }),
+    headers: {
+      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
   });
-  const body = await resp.text();
-  log("say() response", { status: resp.status, ok: resp.ok, body });
-  return resp.ok;
+  const t = await res.text();
+  log("say() →", res.status, t);
+  return { status: res.status, body: t };
 }
+
 
 
 // ---------- mock calendar config ----------
