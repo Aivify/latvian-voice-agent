@@ -39,14 +39,17 @@ async function say(callId, text) {
     "OpenAI-Beta": "realtime=v1",
     ...(process.env.OPENAI_PROJECT && { "OpenAI-Project": process.env.OPENAI_PROJECT }),
   };
-  return fetch(url, {
+  const resp = await fetch(url, {
     method: "POST",
     headers,
     body: JSON.stringify({
       instructions: text,
-      modalities: ["audio"], // <- ensure audio is spoken out
+      modalities: ["audio"], // ensure TTS is produced
     }),
   });
+  const body = await resp.text();
+  log("say() response", { status: resp.status, ok: resp.ok, body });
+  return resp.ok;
 }
 
 // ---------- mock calendar config ----------
@@ -122,16 +125,29 @@ const server = http.createServer(async (req, res) => {
         const payload = {
           model: process.env.MODEL || "gpt-4o-realtime-preview",
           voice: process.env.VOICE || "marin",
-          input_audio_format: "g711_ulaw", // <- important for PSTN reliability
+
+          // Make PSTN/SIP bridges happy on both directions
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+
           instructions: instructionsPaulaLV,
         };
 
         const accept = await acceptCall(callId, payload);
 
         if (accept.ok) {
-          // tiny delay so the session is ready to play audio
-          await sleep(400);
-          await say(callId, "Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.");
+          // give the realtime session a moment to fully open audio
+          await sleep(600);
+
+          // GDPR line — retry once if first attempt fails
+          let ok1 = await say(callId, "Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.");
+          if (!ok1) {
+            await sleep(400);
+            ok1 = await say(callId, "Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.");
+          }
+
+          // short gap, then intro
+          await sleep(200);
           await say(callId, "Labdien! Te Paula no Aivify. Ar ko man ir gods runāt?");
         }
 
