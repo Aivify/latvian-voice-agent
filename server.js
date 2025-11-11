@@ -34,19 +34,19 @@ const server = http.createServer(async (req, res) => {
         } else {
           console.log("📞 Call ID:", callId, "- accepting…");
           const r = await fetch(`https://api.openai.com/v1/realtime/calls/${callId}/accept`, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              type: "realtime",
-              model: "gpt-realtime",
-              instructions: "Tu esi laipns latviešu balss aģents. Runā īsi, skaidri un draudzīgi.",
-              // voice: "verse", // optional
-              // input_audio_format: "g711_ulaw" // optional
-            }),
-          });
+  method: "POST",
+  headers: {
+    "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+    "Content-Type": "application/json",
+    "OpenAI-Beta": "realtime=v1",
+    ...(process.env.OPENAI_PROJECT && { "OpenAI-Project": process.env.OPENAI_PROJECT })
+  },
+  body: JSON.stringify({
+    type: "realtime",
+    model: "gpt-4o-realtime-preview",
+    instructions: "Tu esi laipns latviešu balss aģents. Runā īsi, skaidri un draudzīgi."
+  }),
+});
           console.log("✅ Accept status:", r.status);
           if (r.status !== 200) console.log("❌ Accept error body:", await r.text());
         }
