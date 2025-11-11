@@ -27,6 +27,10 @@ async function acceptCall(callId, payload) {
   log("← Accept response", { status: r.status, ok: r.ok, body: text });
   return { status: r.status, ok: r.ok, body: text };
 }
+
+// small buffer after accept to avoid race conditions
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function say(callId, text) {
   const url = `https://api.openai.com/v1/realtime/calls/${callId}/responses`;
   const headers = {
@@ -38,10 +42,12 @@ async function say(callId, text) {
   return fetch(url, {
     method: "POST",
     headers,
-    body: JSON.stringify({ instructions: text }),
+    body: JSON.stringify({
+      instructions: text,
+      modalities: ["audio"], // <- ensure audio is spoken out
+    }),
   });
 }
-
 
 // ---------- mock calendar config ----------
 const TZ = process.env.TZ || "Europe/Riga";
@@ -116,12 +122,15 @@ const server = http.createServer(async (req, res) => {
         const payload = {
           model: process.env.MODEL || "gpt-4o-realtime-preview",
           voice: process.env.VOICE || "marin",
-          // input_audio_format: "g711_ulaw",
+          input_audio_format: "g711_ulaw", // <- important for PSTN reliability
           instructions: instructionsPaulaLV,
         };
 
         const accept = await acceptCall(callId, payload);
+
         if (accept.ok) {
+          // tiny delay so the session is ready to play audio
+          await sleep(400);
           await say(callId, "Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.");
           await say(callId, "Labdien! Te Paula no Aivify. Ar ko man ir gods runāt?");
         }
