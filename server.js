@@ -60,21 +60,21 @@ async function speakFirst(callId, lines) {
         // 1) GDPR line
         ws.send(JSON.stringify({
           type: "response.create",
-          response: { instructions: lines[0], modalities: ["audio"] }
+          response: { instructions: lines[0], modalities: ["audio", "text"] }
         }));
 
         // 2) Intro after a short gap
         setTimeout(() => {
           ws.send(JSON.stringify({
             type: "response.create",
-            response: { instructions: lines[1], modalities: ["audio"] }
+            response: { instructions: lines[1], modalities: ["audio", "text"] }
           }));
 
           // 3) Comfort ping ~1s later (helps if the first packet gets swallowed)
           setTimeout(() => {
             ws.send(JSON.stringify({
               type: "response.create",
-              response: { instructions: "Sveiki.", modalities: ["audio"] }
+              response: { instructions: "Sveiki.", modalities: ["audio", "text"] }
             }));
 
             // close shortly after queuing messages
