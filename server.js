@@ -54,50 +54,53 @@ async function speakFirst(callId, lines) {
       }
     });
 
+    let stage = 0; // 0=not started, 1=GDPR in progress, 2=intro in progress, 3=comfort ping in progress, 4=done
+
+    function sendResponse(text) {
+      ws.send(JSON.stringify({
+        type: "response.create",
+        response: { instructions: text, modalities: ["audio", "text"] }
+      }));
+    }
+
     ws.on("open", () => {
-      // small delay so PSTN/SIP bridge is fully ready
+      // small buffer so the PSTN/SIP bridge is ready
       setTimeout(() => {
-        // 1) GDPR line
-        ws.send(JSON.stringify({
-          type: "response.create",
-          response: { instructions: lines[0], modalities: ["audio", "text"] }
-        }));
-
-        // 2) Intro after a short gap
-        setTimeout(() => {
-          ws.send(JSON.stringify({
-            type: "response.create",
-            response: { instructions: lines[1], modalities: ["audio", "text"] }
-          }));
-
-          // 3) Comfort ping ~1s later (helps if the first packet gets swallowed)
-          setTimeout(() => {
-            ws.send(JSON.stringify({
-              type: "response.create",
-              response: { instructions: "Sveiki.", modalities: ["audio", "text"] }
-            }));
-
-            // close shortly after queuing messages
-            setTimeout(() => { try { ws.close(); } catch {} resolve(); }, 400);
-          }, 1000);
-        }, 300);
+        stage = 1;
+        sendResponse(lines[0]); // GDPR first
       }, 700);
     });
 
     ws.on("message", (buf) => {
       try {
         const evt = JSON.parse(buf.toString());
-        if (evt.type?.startsWith("response.") || evt.type === "error") {
-          log("WS evt:", evt.type);
-          if (evt.type === "error") log("WS error:", evt);
+        if (evt.type === "error") {
+          // If we ever hit "conversation_already_has_active_response", just wait; the done handler will advance.
+          console.log("WS error:", evt);
+        }
+
+        // Advance strictly when the model finishes speaking
+        if (evt.type === "response.done") {
+          if (stage === 1) {
+            stage = 2;
+            sendResponse(lines[1]); // Intro after GDPR is fully done
+          } else if (stage === 2) {
+            stage = 3;
+            // tiny comfort ping ~1s later to beat first-packet swallow on PSTN
+            setTimeout(() => sendResponse("Sveiki."), 1000);
+          } else if (stage === 3) {
+            stage = 4;
+            setTimeout(() => { try { ws.close(); } catch {} resolve(); }, 300);
+          }
         }
       } catch {}
     });
 
-    ws.on("error", (e) => { log("WS error:", e?.message || e); resolve(); });
-    ws.on("close", () => { log("WS closed"); resolve(); });
+    ws.on("error", (e) => { console.log("WS error:", e?.message || e); resolve(); });
+    ws.on("close", () => { console.log("WS closed"); resolve(); });
   });
 }
+
 
 // ---------- mock calendar config ----------
 const TZ = process.env.TZ || "Europe/Riga";
