@@ -62,6 +62,10 @@ const server = http.createServer(async (req, res) => {
       return res.end();
     }
   }
+if (req.method === "GET" && req.url === "/") {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  return res.end("✅ Latvian Voice Agent backend is running.\nTry /health or POST /webhooks/openai");
+}
 
   res.writeHead(404);
   res.end();
