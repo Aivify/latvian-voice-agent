@@ -42,11 +42,14 @@ const server = http.createServer(async (req, res) => {
     ...(process.env.OPENAI_PROJECT && { "OpenAI-Project": process.env.OPENAI_PROJECT })
   },
   body: JSON.stringify({
-    type: "realtime",
     model: "gpt-4o-realtime-preview",
+    // Optional but recommended:
+    // voice: "verse",
+    // input_audio_format: "g711_ulaw",
     instructions: "Tu esi laipns latviešu balss aģents. Runā īsi, skaidri un draudzīgi."
   }),
 });
+
           console.log("✅ Accept status:", r.status);
           if (r.status !== 200) console.log("❌ Accept error body:", await r.text());
         }
