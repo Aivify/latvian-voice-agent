@@ -27,6 +27,21 @@ async function acceptCall(callId, payload) {
   log("← Accept response", { status: r.status, ok: r.ok, body: text });
   return { status: r.status, ok: r.ok, body: text };
 }
+async function say(callId, text) {
+  const url = `https://api.openai.com/v1/realtime/calls/${callId}/responses`;
+  const headers = {
+    "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+    "Content-Type": "application/json",
+    "OpenAI-Beta": "realtime=v1",
+    ...(process.env.OPENAI_PROJECT && { "OpenAI-Project": process.env.OPENAI_PROJECT }),
+  };
+  return fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ instructions: text }),
+  });
+}
+
 
 // ---------- mock calendar config ----------
 const TZ = process.env.TZ || "Europe/Riga";
@@ -106,6 +121,11 @@ const server = http.createServer(async (req, res) => {
         };
 
         const accept = await acceptCall(callId, payload);
+        if (accept.ok) {
+          await say(callId, "Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.");
+          await say(callId, "Labdien! Te Paula no Aivify. Ar ko man ir gods runāt?");
+        }
+
         res.writeHead(200, { "Content-Type": "application/json" });
         return res.end(JSON.stringify({ received: true, accept_status: accept.status }));
       }
