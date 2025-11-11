@@ -32,7 +32,7 @@ async function acceptCall(callId, payload) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function say(callId, text) {
-  const url = `https://api.openai.com/v1/realtime/calls/${callId}/responses`;
+  const url = `https://api.openai.com/v1/realtime/calls/${callId}/response`; // ← singular!
   const headers = {
     "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
     "Content-Type": "application/json",
@@ -44,13 +44,14 @@ async function say(callId, text) {
     headers,
     body: JSON.stringify({
       instructions: text,
-      modalities: ["audio"], // ensure TTS is produced
+      modalities: ["audio"],     // force TTS
     }),
   });
   const body = await resp.text();
   log("say() response", { status: resp.status, ok: resp.ok, body });
   return resp.ok;
 }
+
 
 // ---------- mock calendar config ----------
 const TZ = process.env.TZ || "Europe/Riga";
