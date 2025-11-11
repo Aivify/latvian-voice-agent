@@ -1,5 +1,7 @@
 import http from "http";
 import dotenv from "dotenv";
+import { instructionsPaulaLV } from "./prompts/paula_lv.js";
+
 dotenv.config();
 
 const PORT = process.env.PORT || 8080;
@@ -80,9 +82,9 @@ const server = http.createServer(async (req, res) => {
         const payload = {
           model: "gpt-4o-realtime-preview",
           // Optional configuration for later:
-          // voice: "verse",
+          voice: "marin",
           // input_audio_format: "g711_ulaw",
-          instructions: "Tu esi laipns latviešu balss aģents. Runā īsi, skaidri un draudzīgi. Tavs vārds ir Paula, tu pirmā sāc sarunu un pasaki savu vārdu"
+          instructions: instructionsPaulaLV,
         };
 
         const accept = await acceptCall(callId, payload);
@@ -106,6 +108,168 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ error: "internal_error" }));
     }
   }
+const server = http.createServer(async (req, res) => {
+  const { method, url } = req;
+  const parsed = new URL(req.url, "http://local");
+  const pathname = parsed.pathname;
+
+  // Root sanity check
+  if (method === "GET" && pathname === "/") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    return res.end("Latvian Voice Agent backend is running.\nTry /health or POST /webhooks/openai");
+  }
+
+  // Health route
+  if (method === "GET" && pathname === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: true }));
+  }
+
+  // Webhook route
+  if (method === "POST" && pathname === "/webhooks/openai") {
+    try {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const bodyText = Buffer.concat(chunks).toString();
+
+      log("➡️  Incoming POST /webhooks/openai", {
+        ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress,
+        ua: req.headers["user-agent"],
+        len: req.headers["content-length"],
+      });
+      log("Body:", bodyText.slice(0, 2000));
+
+      let event;
+      try {
+        event = JSON.parse(bodyText || "{}");
+      } catch (e) {
+        log("❌ JSON parse error:", e.message);
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "invalid_json" }));
+      }
+
+      const type = event?.type || "unknown";
+      const callId = event?.data?.call_id;
+
+      if (type === "realtime.call.incoming") {
+        if (!callId) {
+          log("❌ Missing call_id in incoming event");
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "missing_call_id" }));
+        }
+
+        const payload = {
+          model: process.env.MODEL || "gpt-4o-realtime-preview",
+          voice: process.env.VOICE || "marin",
+          instructions: instructionsPaulaLV,
+        };
+
+        const accept = await acceptCall(callId, payload);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ received: true, accept_status: accept.status }));
+      }
+
+      if (type.startsWith?.("realtime.call.")) {
+        log("ℹ️  Lifecycle event:", type, { call_id: callId, data: event?.data });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: true }));
+      }
+
+      log("ℹ️  Ignored event type:", type);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, ignored: type }));
+    } catch (err) {
+      log("❌ Webhook handler error:", err?.stack || err?.message || err);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "internal_error" }));
+    }
+  }
+
+  // ---- Demo Calendar API (mock) ---------------------------------------------
+
+  const TZ = process.env.TZ || "Europe/Riga";
+  const MEETING_MINUTES = Number(process.env.MEETING_MINUTES || 30);
+  const WORK_START = 10; // 10:00
+  const WORK_END = 17;   // 17:00
+
+  const bookings = [];
+
+  function toISO(dt) { return new Date(dt).toISOString(); }
+  function roundUpToNextHalfHour(date = new Date()) {
+    const d = new Date(date);
+    d.setSeconds(0, 0);
+    const m = d.getMinutes();
+    d.setMinutes(m <= 30 ? 30 : 60);
+    if (m > 30) d.setHours(d.getHours() + 1);
+    return d;
+  }
+  function isSameISO(a, b) { return new Date(a).getTime() === new Date(b).getTime(); }
+
+  // GET /calendar/slots?days=2
+  if (method === "GET" && pathname === "/calendar/slots") {
+    const days = Number(parsed.searchParams.get("days") || 2);
+    const now = new Date();
+    const start = roundUpToNextHalfHour(now);
+
+    const out = [];
+    for (let d = 0; d <= days; d++) {
+      const day = new Date(now);
+      day.setDate(day.getDate() + d);
+      for (let h = WORK_START; h < WORK_END; h++) {
+        for (let m of [0, 30]) {
+          const slot = new Date(day);
+          slot.setHours(h, m, 0, 0);
+          if (slot < start && d === 0) continue;
+          const taken = bookings.some(b => isSameISO(b.slot, slot.toISOString()));
+          if (!taken) out.push({
+            slot: toISO(slot),
+            duration_min: MEETING_MINUTES,
+            tz: TZ
+          });
+        }
+      }
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ slots: out.slice(0, 8) }));
+  }
+
+  // POST /calendar/book
+  if (method === "POST" && pathname === "/calendar/book") {
+    try {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      const { slotISO, name = "Unknown", phone = "" } = body;
+
+      if (!slotISO) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "slotISO_required" }));
+      }
+
+      const already = bookings.some(b => isSameISO(b.slot, slotISO));
+      if (already) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "slot_taken" }));
+      }
+
+      const eventId = "demo_" + Math.random().toString(36).slice(2, 10);
+      bookings.push({ id: eventId, slot: slotISO, name, phone, created_at: new Date().toISOString() });
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, eventId, slotISO, name }));
+    } catch (e) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "bad_json" }));
+    }
+  }
+
+  // 404 fallback
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "not_found" }));
+});
+
+server.listen(PORT, () => log(`🚀 Server running on http://localhost:${PORT}`));
+
 
   // 404 fallback
   res.writeHead(404, { "Content-Type": "application/json" });
