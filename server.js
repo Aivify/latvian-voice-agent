@@ -10,6 +10,7 @@ const MODEL = process.env.MODEL || "gpt-4o-realtime-preview";
 const VOICE = process.env.VOICE || "marin";
 const CODEC = "g711_ulaw";
 
+// === EDIT IF NEEDED ===
 const GDPR_LINE = "Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.";
 
 const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
@@ -31,6 +32,7 @@ async function acceptCall(callId) {
     voice: VOICE,
     input_audio_format: CODEC,
     output_audio_format: CODEC,
+    // Paula's persona for *after* GDPR
     instructions: instructionsPaulaLV
   };
   log("→ Accept", callId);
@@ -60,6 +62,8 @@ function speakFirst(callId) {
     }
   });
 
+  let phase = "init"; // init -> primer -> gdpr -> chat
+
   const send = (msg) => ws.send(JSON.stringify(msg));
   const say  = (text) => send({
     type: "response.create",
@@ -73,12 +77,12 @@ function speakFirst(callId) {
   ws.on("open", () => {
     log(`[${callId}] WS open`);
 
-    // keep deterministic during GDPR
+    // keep deterministic during scripted part
     send({
       type: "session.update",
       session: {
-        turn_detection: null,
-        input_audio_transcription: null,
+        turn_detection: null,                 // no VAD during primer+GDPR
+        input_audio_transcription: null,     // no ASR during primer+GDPR
         temperature: 0,
         modalities: ["audio","text"],
         input_audio_format: CODEC,
@@ -88,9 +92,10 @@ function speakFirst(callId) {
     });
     log(`[${callId}] session.update (silent)`);
 
-    // say GDPR once
-    say(GDPR_LINE);
-    log(`[${callId}] GDPR sent`);
+    // 1) PRIMER — wakes RTP path so GDPR won't be swallowed
+    phase = "primer";
+    say("Sveiki.");
+    log(`[${callId}] primer sent`);
   });
 
   ws.on("message", (buf) => {
@@ -98,20 +103,30 @@ function speakFirst(callId) {
     const t = evt.type;
 
     if (t === "response.output_audio_buffer.started") log(`[${callId}] audio STARTED`);
+    // (optional) if (t === "response.output_audio.delta") { /* first chunk seen */ }
+
     if (t === "response.done") {
-      log(`[${callId}] GDPR done -> enabling chat mode`);
-      // enable conversation
-      send({
-        type: "session.update",
-        session: {
-          turn_detection: { type: "server_vad" },
-          input_audio_transcription: { model: "whisper-1" }, // optional
-          instructions: instructionsPaulaLV,
-          temperature: 0.6
-        }
-      });
-      log(`[${callId}] session.update (chat mode)`);
-      // keep WS open for convo (do not close)
+      if (phase === "primer") {
+        // 2) Now say GDPR (path already open)
+        phase = "gdpr";
+        say(GDPR_LINE);
+        log(`[${callId}] GDPR sent`);
+      } else if (phase === "gdpr") {
+        // 3) Flip to normal conversation (enable VAD + persona)
+        phase = "chat";
+        log(`[${callId}] GDPR done -> enabling chat mode`);
+        send({
+          type: "session.update",
+          session: {
+            turn_detection: { type: "server_vad" },          // now auto-turns on
+            input_audio_transcription: { model: "whisper-1" }, // optional ASR
+            instructions: instructionsPaulaLV,
+            temperature: 0.6
+          }
+        });
+        log(`[${callId}] session.update (chat mode)`);
+        // keep WS open for conversation
+      }
     }
   });
 
