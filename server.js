@@ -43,7 +43,7 @@ async function acceptCall(callId) {
 }
 
 function speakFirst(callId) {
-  if (speaking.has(callId)) return; // already started
+  if (speaking.has(callId)) return;
   speaking.add(callId);
 
   const qs = new URLSearchParams({
@@ -62,9 +62,9 @@ function speakFirst(callId) {
     }
   });
 
-  let phase = "init"; // init -> primer -> gdpr -> chat
-
-  const send = (msg) => ws.send(JSON.stringify(msg));
+  let phase = "init";                       // init -> primer -> gdpr -> chat
+  let keepAlive;                            // ping timer
+  const send = (m) => ws.send(JSON.stringify(m));
   const say  = (text) => send({
     type: "response.create",
     response: {
@@ -77,12 +77,15 @@ function speakFirst(callId) {
   ws.on("open", () => {
     log(`[${callId}] WS open`);
 
-    // keep deterministic during scripted part
+    // --- keepalive to avoid 1006 while model is preparing ---
+    keepAlive = setInterval(() => { try { ws.ping(); } catch {} }, 10000);
+
+    // deterministic during scripted part
     send({
       type: "session.update",
       session: {
-        turn_detection: null,                 // no VAD during primer+GDPR
-        input_audio_transcription: null,     // no ASR during primer+GDPR
+        turn_detection: null,
+        input_audio_transcription: null,
         temperature: 0,
         modalities: ["audio","text"],
         input_audio_format: CODEC,
@@ -92,7 +95,7 @@ function speakFirst(callId) {
     });
     log(`[${callId}] session.update (silent)`);
 
-    // 1) PRIMER — wakes RTP path so GDPR won't be swallowed
+    // PRIMER first (opens RTP path)
     phase = "primer";
     say("Sveiki.");
     log(`[${callId}] primer sent`);
@@ -101,38 +104,55 @@ function speakFirst(callId) {
   ws.on("message", (buf) => {
     let evt; try { evt = JSON.parse(buf.toString()); } catch { return; }
     const t = evt.type;
+    // --- verbose tracing: see EVERYTHING the model emits ---
+    if (t !== "response.output_audio.delta") {
+      log(`[${callId}] EVT`, t, evt?.response?.id ? `rid=${evt.response.id}` : "");
+    }
 
-    if (t === "response.output_audio_buffer.started") log(`[${callId}] audio STARTED`);
-    // (optional) if (t === "response.output_audio.delta") { /* first chunk seen */ }
+    if (t === "response.output_audio_buffer.started") {
+      log(`[${callId}] audio STARTED rid=${evt.response?.id || "-"}`);
+    }
+    if (t === "response.error") {
+      log(`[${callId}] response.error`, JSON.stringify(evt, null, 2));
+    }
+    if (t === "response.failed") {
+      log(`[${callId}] response.failed`, JSON.stringify(evt, null, 2));
+    }
 
     if (t === "response.done") {
       if (phase === "primer") {
-        // 2) Now say GDPR (path already open)
         phase = "gdpr";
         say(GDPR_LINE);
         log(`[${callId}] GDPR sent`);
       } else if (phase === "gdpr") {
-        // 3) Flip to normal conversation (enable VAD + persona)
         phase = "chat";
         log(`[${callId}] GDPR done -> enabling chat mode`);
         send({
           type: "session.update",
           session: {
-            turn_detection: { type: "server_vad" },          // now auto-turns on
-            input_audio_transcription: { model: "whisper-1" }, // optional ASR
+            turn_detection: { type: "server_vad" },
+            input_audio_transcription: { model: "whisper-1" }, // optional
             instructions: instructionsPaulaLV,
             temperature: 0.6
           }
         });
         log(`[${callId}] session.update (chat mode)`);
-        // keep WS open for conversation
+        // IMPORTANT: do NOT close; keep the WS for conversation
       }
     }
   });
 
-  ws.on("close", (c, r) => log(`[${callId}] WS close`, c, r?.toString() || ""));
-  ws.on("error", (e) => log(`[${callId}] WS error`, e?.message || e));
+  ws.on("ping", () => { try { ws.pong(); } catch {} });
+  ws.on("close", (c, r) => {
+    if (keepAlive) clearInterval(keepAlive);
+    log(`[${callId}] WS close`, c, r?.toString() || "");
+  });
+  ws.on("error", (e) => {
+    if (keepAlive) clearInterval(keepAlive);
+    log(`[${callId}] WS error`, e?.message || e);
+  });
 }
+
 
 // ---- tiny HTTP server: /, /health, /webhooks/openai ----
 const server = http.createServer(async (req, res) => {
