@@ -40,17 +40,17 @@ async function acceptCall(callId) {
 }
 
 // --- Speak-first (GDPR → then normal convo) ---
-function speakFirst(callId) {
+async function speakFirst(callId) {
   return new Promise((resolve) => {
-    const qs = new URLSearchParams({
-      model: MODEL,
-      voice: VOICE,
-      input_audio_format: CODEC,
-      output_audio_format: CODEC,
-      call_id: callId
+    const params = new URLSearchParams({
+      model: process.env.MODEL || "gpt-4o-realtime-preview",
+      voice: process.env.VOICE || "marin",
+      input_audio_format: "g711_ulaw",
+      output_audio_format: "g711_ulaw",
+      call_id: callId,
     });
 
-    const ws = new WebSocket(`wss://api.openai.com/v1/realtime?${qs.toString()}`, {
+    const ws = new WebSocket(`wss://api.openai.com/v1/realtime?${params.toString()}`, {
       headers: {
         "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
         "OpenAI-Beta": "realtime=v1",
@@ -58,22 +58,21 @@ function speakFirst(callId) {
       }
     });
 
-    let phase = "init"; // init -> gdpr -> chat
+    let phase = "init";   // init -> primer -> gdpr -> chat
+    let deltaCount = 0;
 
     const send = (msg) => ws.send(JSON.stringify(msg));
-    const say = (text) => send({
+    const say  = (text) => send({
       type: "response.create",
       response: {
         modalities: ["audio","text"],
         instructions: text,
-        audio: { voice: VOICE, format: CODEC }
+        audio: { voice: (process.env.VOICE || "marin"), format: "g711_ulaw" }
       }
     });
 
     ws.on("open", () => {
-      log(`[${callId}] WS open`);
-
-      // 1) Mute auto-behavior: no VAD, no ASR, deterministic for GDPR line
+      // Keep model silent/deterministic during scripted part
       send({
         type: "session.update",
         session: {
@@ -81,48 +80,58 @@ function speakFirst(callId) {
           input_audio_transcription: null,
           temperature: 0,
           modalities: ["audio","text"],
-          input_audio_format: CODEC,
-          output_audio_format: CODEC,
-          voice: VOICE
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          voice: (process.env.VOICE || "marin")
         }
       });
-      log(`[${callId}] session.update (silent)`);
 
-      // 2) Say GDPR once
-      phase = "gdpr";
-      say(GDPR_LINE);
-      log(`[${callId}] GDPR sent`);
+      // 1) PRIMER — wakes up the PSTN path so GDPR won’t get swallowed
+      phase = "primer";
+      say("Sveiki.");
     });
 
-    ws.on("message", (buf) => {
+    ws.on("message", async (buf) => {
       let evt; try { evt = JSON.parse(buf.toString()); } catch { return; }
       const t = evt.type;
 
-      if (t === "response.output_audio_buffer.started") log(`[${callId}] audio STARTED`);
-      if (t === "response.done" && phase === "gdpr") {
-        log(`[${callId}] GDPR done`);
+      if (t === "response.output_audio_buffer.started") {
+        // good: media actually began streaming
+        // (this is the event you were missing in logs)
+        // optional: console.log("audio STARTED");
+      }
+      if (t === "response.output_audio.delta") {
+        // fallback marker in case 'started' doesn't arrive on some routes
+        deltaCount++;
+      }
 
-        // 3) Switch to normal conversation: enable VAD + Paula persona
-        send({
-          type: "session.update",
-          session: {
-            turn_detection: { type: "server_vad" },
-            // optional ASR (remove if you don’t want live transcription)
-            input_audio_transcription: { model: "whisper-1" },
-            instructions: instructionsPaulaLV,
-            temperature: 0.6
-          }
-        });
-        log(`[${callId}] session.update (chat mode)`);
-        phase = "chat";
-        resolve(); // we’re done with the speak-first step; keep WS open for convo
+      if (t === "response.done") {
+        if (phase === "primer") {
+          // 2) Now say GDPR, with path already open
+          phase = "gdpr";
+          say("Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.");
+        } else if (phase === "gdpr") {
+          // 3) Switch to normal conversation (your Paula prompt), keep WS open
+          phase = "chat";
+          send({
+            type: "session.update",
+            session: {
+              turn_detection: { type: "server_vad" },
+              input_audio_transcription: { model: "whisper-1" }, // optional
+              instructions: instructionsPaulaLV,
+              temperature: 0.6
+            }
+          });
+          return resolve();
+        }
       }
     });
 
-    ws.on("close", (c, r) => log(`[${callId}] WS close`, c, r?.toString() || ""));
-    ws.on("error", (e) => log(`[${callId}] WS error`, e?.message || e));
+    ws.on("error", (e) => { /* console.log("WS error", e?.message||e); */ resolve(); });
+    ws.on("close", () => { resolve(); });
   });
 }
+
 
 // --- Tiny HTTP server: /, /health, /webhooks/openai only ---
 const server = http.createServer(async (req, res) => {
