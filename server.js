@@ -1,208 +1,274 @@
-import 'dotenv/config';
-import Fastify from 'fastify';
-import { WebSocket } from 'ws';
-import { fetch } from 'undici';
+import http from "http";
+import dotenv from "dotenv";
+import { instructionsPaulaLV } from "./prompts/paula_lv.js";
+import WebSocket from "ws";
 
-const fastify = Fastify({ logger: true });
+dotenv.config();
 
-const PORT  = process.env.PORT || 8080;
-const API_KEY = process.env.OPENAI_API_KEY;
+const PORT = process.env.PORT || 8080;
 
-if (!API_KEY) {
-  console.error('Missing OPENAI_API_KEY in env');
-  process.exit(1);
+// ---------- helpers ----------
+function log(...args) {
+  const ts = new Date().toISOString();
+  console.log(`[${ts}]`, ...args);
 }
 
-// --- Model & media config ---
-const MODEL = 'gpt-4o-realtime-preview';
-const VOICE = 'marin';
-const ALAW  = 'g711_ulaw';
+async function acceptCall(callId, payload) {
+  const url = `https://api.openai.com/v1/realtime/calls/${callId}/accept`;
+  const headers = {
+    "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+    "Content-Type": "application/json",
+    "OpenAI-Beta": "realtime=v1",
+    ...(process.env.OPENAI_PROJECT && { "OpenAI-Project": process.env.OPENAI_PROJECT }),
+  };
 
-// --- Lines to speak first ---
-const GDPR  = 'Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.';
-const INTRO = 'Sveiki! Mani sauc Paula un es esmu Aivify asistente. Ar ko man ir gods runāt?';
+  log("→ Accepting call", callId, "with payload:", payload);
+  const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
+  const text = await r.text();
+  log("← Accept response", { status: r.status, ok: r.ok, body: text });
+  return { status: r.status, ok: r.ok, body: text };
+}
 
-// --- Strict instructions for speak-first phase (no improvisation) ---
-const STRICT = [
-  'Speak only when explicitly instructed via response.create.',
-  'Read Latvian text verbatim. Do not improvise.',
-  'No persona. No small talk.',
-  'Stay silent unless instructed. Do not transcribe or react to background audio.'
-].join(' ');
+// small buffer after accept to avoid race conditions
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Health
-fastify.get('/health', async () => ({ ok: true }));
-
-// Webhook: accept the call, then speak-first over WS
-fastify.post('/webhooks/openai', async (request, reply) => {
-  try {
-    const eventType = request.body?.type;
-    const callId =
-      request.body?.data?.call_id ||
-      request.body?.data?.id ||
-      request.body?.data?.call?.id;
-
-    if (eventType !== 'realtime.call.incoming' || !callId) {
-      return reply.code(200).send({ ok: true, ignored: true });
-    }
-
-    // 1) ACCEPT the call with the strict speak-first settings
-    const acceptUrl = `https://api.openai.com/v1/realtime/calls/${callId}/accept`;
-    const acceptBody = {
-      model: MODEL,
-      voice: VOICE,
-      input_audio_format: ALAW,
-      output_audio_format: ALAW,
-      instructions: STRICT
-    };
-
-    const acceptResp = await fetch(acceptUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${API_KEY}`,
-        'Content-Type': 'application/json',
-        'OpenAI-Beta': 'realtime=v1'
-      },
-      body: JSON.stringify(acceptBody)
+/**
+ * Open a short-lived Realtime WebSocket bound to this call
+ * and queue 3 responses: GDPR → intro → tiny comfort ping.
+ */
+async function speakFirst(callId, lines) {
+  return new Promise((resolve) => {
+    const params = new URLSearchParams({
+      model: process.env.MODEL || "gpt-4o-realtime-preview",
+      voice: process.env.VOICE || "marin",
+      input_audio_format: "g711_ulaw",
+      output_audio_format: "g711_ulaw",
+      call_id: callId,
     });
 
-    if (!acceptResp.ok) {
-      const txt = await acceptResp.text();
-      request.log.error({ status: acceptResp.status, txt }, 'ACCEPT FAILED');
-      // Acknowledge webhook so provider won’t retry; we still log failure
-      return reply.code(200).send({ ok: false, stage: 'accept', status: acceptResp.status });
-    }
-
-    // Ack webhook quickly
-    reply.code(200).send({ ok: true });
-
-    // 2) Open WS bound to call_id
-    const wsUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}&call_id=${encodeURIComponent(callId)}`;
-    const ws = new WebSocket(wsUrl, {
+    const ws = new WebSocket(`wss://api.openai.com/v1/realtime?${params.toString()}`, {
       headers: {
-        Authorization: `Bearer ${API_KEY}`,
-        'OpenAI-Beta': 'realtime=v1'
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+        ...(process.env.OPENAI_PROJECT && { "OpenAI-Project": process.env.OPENAI_PROJECT }),
       }
     });
 
-    // --- state machine ---
-    const state = {
-      phase: 'init',                 // init -> gdpr -> intro -> chat
-      audioStartedFor: new Set(),    // response.id that actually started audio
-      timers: new Map()              // response.id -> timeout
-    };
+    let stage = 0; // 0=not started, 1=GDPR in progress, 2=intro in progress, 3=comfort ping in progress, 4=done
 
-    const log = (...a) => request.log.info({ callId }, a.map(x => (typeof x === 'string' ? x : JSON.stringify(x))).join(' '));
-    const delay = (ms) => new Promise(r => setTimeout(r, ms));
-    const clearTimer = (id) => { const t = state.timers.get(id); if (t) { clearTimeout(t); state.timers.delete(id); } };
-
-    const sendSessionUpdate = (session) => {
-      ws.send(JSON.stringify({ type: 'session.update', session }));
-    };
-
-    const sendLine = (text) => {
+    function sendResponse(text) {
       ws.send(JSON.stringify({
-        type: 'response.create',
-        response: {
-          modalities: ['audio', 'text'],
-          instructions: text,
-          audio: { voice: VOICE, format: ALAW }
-        }
+        type: "response.create",
+        response: { instructions: text, modalities: ["audio", "text"] }
       }));
-      log('response.create:', text);
-    };
+    }
 
-    const armNoStartRetry = (responseId, text) => {
-      const t = setTimeout(() => {
-        if (!state.audioStartedFor.has(responseId)) {
-          log(`No audio start for ${responseId} in 1200ms → retry line once`);
-          sendLine(text);
-        }
-      }, 1200);
-      state.timers.set(responseId, t);
-    };
-
-    ws.on('open', async () => {
-      log('WS open');
-
-      // 2a) Disable auto behaviors so model stays silent until we speak
-      sendSessionUpdate({
-        turn_detection: null,                 // disable VAD / auto-turns
-        input_audio_transcription: null,     // no ambient ASR
-        instructions: STRICT,                // keep strict instructions in-session
-        temperature: 0,
-        modalities: ['audio', 'text'],
-        input_audio_format: ALAW,
-        output_audio_format: ALAW,
-        voice: VOICE
-      });
-      log('session.update (silent) sent');
-
-      // 2b) Let PSTN/SIP bridge settle a bit
-      await delay(800);
-
-      // 3) GDPR first
-      state.phase = 'gdpr';
-      sendLine(GDPR);
+    ws.on("open", () => {
+      // small buffer so the PSTN/SIP bridge is ready
+      setTimeout(() => {
+        stage = 1;
+        sendResponse(lines[0]); // GDPR first
+      }, 700);
     });
 
-    ws.on('message', async (data) => {
-      let evt;
-      try { evt = JSON.parse(data.toString()); } catch { return; }
-
-      const t = evt.type;
-
-      // Mark actual audio start (prefer explicit, fallback to first delta)
-      if (t === 'response.output_audio_buffer.started' && evt.response?.id) {
-        state.audioStartedFor.add(evt.response.id);
-        clearTimer(evt.response.id);
-        log('audio STARTED:', evt.response.id);
-      }
-      if (t === 'response.output_audio.delta' && evt.response?.id && !state.audioStartedFor.has(evt.response.id)) {
-        state.audioStartedFor.add(evt.response.id);
-        clearTimer(evt.response.id);
-        log('audio DELTA -> treat as started:', evt.response.id);
-      }
-
-      // Arm retry timer for GDPR once we see it's created
-      if (t === 'response.created' && evt.response?.id && state.phase === 'gdpr') {
-        armNoStartRetry(evt.response.id, GDPR);
-      }
-
-      // Advance on completion
-      if (t === 'response.done' && evt.response?.id) {
-        clearTimer(evt.response.id);
-
-        if (state.phase === 'gdpr') {
-          state.phase = 'intro';
-          await delay(250); // tiny gap to avoid overlap on some trunks
-          sendLine(INTRO);
-        } else if (state.phase === 'intro') {
-          // 4) Switch to normal conversation mode
-          state.phase = 'chat';
-          sendSessionUpdate({
-            turn_detection: { type: 'server_vad' },                 // enable VAD
-            input_audio_transcription: { model: 'whisper-1' },      // optional live ASR
-            temperature: 0.6,
-            // Lighter convo instructions (now that speak-first is done)
-            instructions: 'Tu esi laipns latviešu balss asistents. Atbildi īsi un skaidri.'
-          });
-          log('session.update (chat mode) sent — Paula is now in normal convo mode');
+    ws.on("message", (buf) => {
+      try {
+        const evt = JSON.parse(buf.toString());
+        if (evt.type === "error") {
+          // If we ever hit "conversation_already_has_active_response", just wait; the done handler will advance.
+          console.log("WS error:", evt);
         }
-      }
+
+        // Advance strictly when the model finishes speaking
+        if (evt.type === "response.done") {
+          if (stage === 1) {
+            stage = 2;
+            sendResponse(lines[1]); // Intro after GDPR is fully done
+          } else if (stage === 2) {
+            stage = 3;
+            // tiny comfort ping ~1s later to beat first-packet swallow on PSTN
+            setTimeout(() => sendResponse("Sveiki."), 1000);
+          } else if (stage === 3) {
+            stage = 4;
+            setTimeout(() => { try { ws.close(); } catch {} resolve(); }, 300);
+          }
+        }
+      } catch {}
     });
 
-    ws.on('close', (code, reason) => log('WS close', code, reason?.toString() || ''));
-    ws.on('error', (err) => log('WS error', err?.message || err));
-  } catch (e) {
-    request.log.error(e, 'Webhook handler exception');
-    try { reply.code(200).send({ ok: false, error: 'handler_exception' }); } catch {}
+    ws.on("error", (e) => { console.log("WS error:", e?.message || e); resolve(); });
+    ws.on("close", () => { console.log("WS closed"); resolve(); });
+  });
+}
+
+
+// ---------- mock calendar config ----------
+const TZ = process.env.TZ || "Europe/Riga";
+const MEETING_MINUTES = Number(process.env.MEETING_MINUTES || 30);
+const WORK_START = 10; // 10:00
+const WORK_END = 17;   // 17:00
+
+// persist for the life of the process (demo only)
+const bookings = [];
+
+function toISO(dt) { return new Date(dt).toISOString(); }
+function roundUpToNextHalfHour(date = new Date()) {
+  const d = new Date(date);
+  d.setSeconds(0, 0);
+  const m = d.getMinutes();
+  d.setMinutes(m <= 30 ? 30 : 60);
+  if (m > 30) d.setHours(d.getHours() + 1);
+  return d;
+}
+function isSameISO(a, b) { return new Date(a).getTime() === new Date(b).getTime(); }
+
+// ---------- single server ----------
+const server = http.createServer(async (req, res) => {
+  const { method } = req;
+  const parsed = new URL(req.url, "http://local");
+  const pathname = parsed.pathname;
+
+  // root
+  if (method === "GET" && pathname === "/") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    return res.end("Latvian Voice Agent backend is running.\nTry /health or POST /webhooks/openai");
   }
+
+  // health
+  if (method === "GET" && pathname === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: true }));
+  }
+
+  // webhook
+  if (method === "POST" && pathname === "/webhooks/openai") {
+    try {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const bodyText = Buffer.concat(chunks).toString();
+
+      log("➡️  Incoming POST /webhooks/openai", {
+        ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress,
+        ua: req.headers["user-agent"],
+        len: req.headers["content-length"],
+      });
+      log("Body:", bodyText.slice(0, 2000));
+
+      let event;
+      try { event = JSON.parse(bodyText || "{}"); }
+      catch (e) {
+        log("❌ JSON parse error:", e.message);
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "invalid_json" }));
+      }
+
+      const type = event?.type || "unknown";
+      const callId = event?.data?.call_id;
+
+      if (type === "realtime.call.incoming") {
+        if (!callId) {
+          log("❌ Missing call_id");
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "missing_call_id" }));
+        }
+
+        const payload = {
+          model: process.env.MODEL || "gpt-4o-realtime-preview",
+          voice: process.env.VOICE || "marin",
+
+          // Make PSTN/SIP bridges happy on both directions
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+
+          instructions: instructionsPaulaLV,
+        };
+
+        const accept = await acceptCall(callId, payload);
+
+        if (accept.ok) {
+          await speakFirst(callId, [
+            "Informācijai — šis demo zvans var tikt ierakstīts un analizēts kvalitātes nolūkiem.",
+            "Labdien! Te Paula no Aivify. Ar ko man ir gods runāt?"
+          ]);
+        }
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ received: true, accept_status: accept.status }));
+      }
+
+      if (type.startsWith?.("realtime.call.")) {
+        log("ℹ️  Lifecycle event:", type, { call_id: callId, data: event?.data });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: true }));
+      }
+
+      log("ℹ️  Ignored event type:", type);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, ignored: type }));
+    } catch (err) {
+      log("❌ Webhook handler error:", err?.stack || err?.message || err);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "internal_error" }));
+    }
+  }
+
+  // calendar: GET slots
+  if (method === "GET" && pathname === "/calendar/slots") {
+    const days = Number(parsed.searchParams.get("days") || 2);
+    const now = new Date();
+    const start = roundUpToNextHalfHour(now);
+
+    const out = [];
+    for (let d = 0; d <= days; d++) {
+      const day = new Date(now);
+      day.setDate(day.getDate() + d);
+      for (let h = WORK_START; h < WORK_END; h++) {
+        for (const m of [0, 30]) {
+          const slot = new Date(day);
+          slot.setHours(h, m, 0, 0);
+          if (slot < start && d === 0) continue;
+          const taken = bookings.some(b => isSameISO(b.slot, slot.toISOString()));
+          if (!taken) out.push({ slot: toISO(slot), duration_min: MEETING_MINUTES, tz: TZ });
+        }
+      }
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ slots: out.slice(0, 8) }));
+  }
+
+  // calendar: POST book
+  if (method === "POST" && pathname === "/calendar/book") {
+    try {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      const { slotISO, name = "Unknown", phone = "" } = body;
+
+      if (!slotISO) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "slotISO_required" }));
+      }
+      const already = bookings.some(b => isSameISO(b.slot, slotISO));
+      if (already) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "slot_taken" }));
+      }
+
+      const eventId = "demo_" + Math.random().toString(36).slice(2, 10);
+      bookings.push({ id: eventId, slot: slotISO, name, phone, created_at: new Date().toISOString() });
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, eventId, slotISO, name }));
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "bad_json" }));
+    }
+  }
+
+  // not found
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "not_found" }));
 });
 
-fastify.listen({ port: PORT, host: '0.0.0.0' })
-  .then(() => fastify.log.info(`Listening on :${PORT}`))
-  .catch(err => {
-    fastify.log.error(err);
-    process.exit(1);
-  });
+server.listen(PORT, () => log(`🚀 Server running on http://localhost:${PORT}`));
