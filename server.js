@@ -172,16 +172,21 @@ const server = http.createServer(async (req, res) => {
           return res.end(JSON.stringify({ error: "missing_call_id" }));
         }
 
+        
         const payload = {
-          model: process.env.MODEL || "gpt-4o-realtime-preview",
-          voice: process.env.VOICE || "marin",
+         model: process.env.MODEL || "gpt-4o-realtime-preview",
+         voice: process.env.VOICE || "marin",
+         input_audio_format: "g711_ulaw",
+         output_audio_format: "g711_ulaw",
 
-          // Make PSTN/SIP bridges happy on both directions
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-
-          instructions: instructionsPaulaLV,
+         // 🔒 IMPORTANT: No persona. Read only what we send via response.create.
+         instructions: [
+          "Speak only when instructed via response.create.",
+          "When instructed, read the Latvian text VERBATIM — no extra words, no reformulation.",
+          "If not instructed, stay silent."
+         ].join(" ")
         };
+
 
         const accept = await acceptCall(callId, payload);
 
